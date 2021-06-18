@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"k8s.io/klog/v2"
 	"log"
 	"reflect"
 	"testing"
@@ -69,7 +70,11 @@ func init() {
 		panic(err.Error())
 	}
 	//TODO: Replace the generic timeout with an explicit check for the custom metrics from the API Server which times out after some period
-	err = waitForMetrics(120 * time.Second)
+	err = waitForMetrics("filter1_metric", 120 * time.Second)
+	if err != nil {
+		panic(err.Error())
+	}
+	err = waitForMetrics("prioritize2_metric", 120 * time.Second)
 
 	if err != nil {
 		panic(err.Error())
@@ -77,10 +82,11 @@ func init() {
 }
 
 var (
-	prioritize1Policy = getTASPolicy("prioritize1", scheduleonmetric.StrategyType, "prioritize1_metric", "GreaterThan", 0)
-	filter1Policy     = getTASPolicy("filter1", dontschedule.StrategyType, "filter1_metric", "LessThan", 20)
-	filter2Policy     = getTASPolicy("filter2", dontschedule.StrategyType, "filter2_metric", "Equals", 0)
-	deschedule1Policy = getTASPolicy("deschedule1", deschedule.StrategyType, "deschedule1_metric", "GreaterThan", 8)
+	prioritize1Policy       = getTASPolicy("prioritize1", scheduleonmetric.StrategyType, "prioritize1_metric", "GreaterThan", 0, true)
+	prioritizeWithoutFilter = getTASPolicy("prioritize2", scheduleonmetric.StrategyType, "prioritize2_metric", "GreaterThan", 0, false)
+	filter1Policy           = getTASPolicy("filter1", dontschedule.StrategyType, "filter1_metric", "LessThan", 20, false)
+	filter2Policy           = getTASPolicy("filter2", dontschedule.StrategyType, "filter2_metric", "Equals", 0, false)
+	deschedule1Policy       = getTASPolicy("deschedule1", deschedule.StrategyType, "deschedule1_metric", "GreaterThan", 8, true)
 )
 
 // TestTASPrioritize will test the behaviour of a pod with a listed deschedule policy in TAS
@@ -168,7 +174,8 @@ func TestTASPrioritize(t *testing.T) {
 		pod    *v1.Pod
 		want   string
 	}{
-		"Prioritize to highest score node": {policy: prioritize1Policy, pod: podForPolicy(fmt.Sprintf("pod-%v", time.Now().Unix()), prioritize1Policy.Name), want: "kind-worker2"},
+		"Prioritize to highest score node":                     {policy: prioritize1Policy, pod: podForPolicy(fmt.Sprintf("pod-%v", rand.String(8)), prioritize1Policy.Name), want: "kind-worker2"},
+		"Policy with one scheduleonmetric and no dontschedule": {policy: prioritizeWithoutFilter, pod: podForPolicy(fmt.Sprintf("pod-%v", rand.String(8)), prioritizeWithoutFilter.Name), want: "kind-worker2"},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -176,20 +183,22 @@ func TestTASPrioritize(t *testing.T) {
 			//defer the running of a cleanup function to remove the policy and pod after the test case
 			defer cleanup(tc.pod.Name, tc.policy.Name)
 
-			_, err := tascl.Create(tc.policy)
+			pol, err := tascl.Create(tc.policy)
 			if err != nil {
-				log.Print(err)
+				klog.Infof("%v", err)
 			}
 			time.Sleep(time.Second * 5)
 			_, err = cl.CoreV1().Pods("default").Create(context.TODO(), tc.pod, metav1.CreateOptions{})
 			if err != nil {
-				log.Print(err)
+				klog.Infof("%v", err)
+
 			}
 			time.Sleep(time.Second * 5)
 			p, _ := cl.CoreV1().Pods("default").Get(context.TODO(), tc.pod.Name, metav1.GetOptions{})
-			log.Print(p.Name)
 
 			if !reflect.DeepEqual(tc.want, p.Spec.NodeName) {
+				log.Print(pol)
+				log.Print(tasLog())
 				t.Errorf("expected: %v, got: %v", tc.want, p.Spec.NodeName)
 			}
 		})
@@ -232,11 +241,11 @@ func cleanup(podName string, policyName string) {
 	}
 }
 
-func waitForMetrics(timeout time.Duration) error {
+func waitForMetrics( metricName string, timeout time.Duration) error {
 	t := time.Now().Add(timeout)
 	var failureMessage error
 	for time.Now().Before(t) {
-		m, err := cm.GetNodeMetric("filter1_metric")
+		m, err := cm.GetNodeMetric(metricName)
 		if len(m) > 0 {
 			log.Printf("Metrics returned after %v: %v", t.Sub(time.Now()), m)
 			return nil
@@ -278,14 +287,14 @@ func tasLog() string {
 
 }
 
-func getTASPolicy(name string, str string, metric string, operator string, target int64) *api.TASPolicy {
+func getTASPolicy(name string, str string, metric string, operator string, target int64, addDefaultFilter bool) *api.TASPolicy {
 	pol := &api.TASPolicy{
 		TypeMeta:   metav1.TypeMeta{},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 		Spec: api.TASPolicySpec{
 			Strategies: map[string]api.TASPolicyStrategy{
 				//Need to have a base deschedule to make the scheduleonmetric policy work correctly.
-				//TODO: This should be considered a bug.
+				//TODO: This should be considered a bug. The addDefaultFilter was added here to show the impact
 				str: {
 					PolicyName: name,
 					Rules: []api.TASPolicyRule{
@@ -295,14 +304,19 @@ func getTASPolicy(name string, str string, metric string, operator string, targe
 			},
 		},
 	}
-	if str != dontschedule.StrategyType {
-		pol.Spec.Strategies[dontschedule.StrategyType] =
-			api.TASPolicyStrategy{
-				PolicyName: "filter1",
-				Rules: []api.TASPolicyRule{
-					{Metricname: "filter1_metric", Operator: "Equals", Target: 2000000},
-				},
-			}
+	if addDefaultFilter {
+		pol = addDefaultFilterStrategy(pol)
 	}
 	return pol
+}
+
+func addDefaultFilterStrategy (policy *api.TASPolicy) *api.TASPolicy{
+	policy.Spec.Strategies[dontschedule.StrategyType] =
+		api.TASPolicyStrategy{
+			PolicyName: "filter1",
+			Rules: []api.TASPolicyRule{
+				{Metricname: "filter1_metric", Operator: "Equals", Target: 2000000},
+			},
+		}
+		return policy
 }
